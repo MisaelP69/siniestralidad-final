@@ -493,7 +493,8 @@ if ejecutar:
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import make_pipeline
-    from sklearn.metrics import roc_auc_score, confusion_matrix
+    from sklearn.metrics import (roc_auc_score, mean_poisson_deviance,
+                                 mean_absolute_error)
     from scipy.stats import spearmanr, nbinom
     import osmnx as ox
 
@@ -660,10 +661,22 @@ if ejecutar:
         metr = {}
         if metrico:
             orden = np.argsort(oof)[::-1]
+            lam_pos = np.clip(oof, 1e-9, None)
+            # Devianza de Poisson explicada (análogo del R² para conteos):
+            # D² = 1 - dev(modelo)/dev(nulo), con el nulo prediciendo la media
+            dev_mod = mean_poisson_deviance(y_count, lam_pos)
+            dev_nulo = mean_poisson_deviance(
+                y_count, np.full_like(y_count, max(y_count.mean(), 1e-9)))
+            # Calibración por deciles de la tasa predicha (diagnóstico SPF)
+            deciles = pd.qcut(pd.Series(oof).rank(method="first"), 10, labels=False).values
             metr = {"spear": spearmanr(y_count, oof)[0],
                     "cap10": captura_at_k(y_count, oof),
+                    "d2": 1.0 - dev_mod / max(dev_nulo, 1e-12),
+                    "mae": mean_absolute_error(y_count, oof),
+                    "rmse": float(np.sqrt(np.mean((y_count - oof) ** 2))),
                     "roc": (roc_auc_score(y, oof) if 0 < y.sum() < len(y) else np.nan),
-                    "cm": confusion_matrix(y, (inter["eb"].rank(pct=True).values >= 0.90).astype(int)),
+                    "cal_pred": [float(oof[deciles == i].mean()) for i in range(10)],
+                    "cal_obs": [float(y_count[deciles == i].mean()) for i in range(10)],
                     "curva_x": (np.arange(1, len(oof) + 1) / len(oof)).tolist(),
                     "curva_y": (np.cumsum(y_count[orden]) / max(1.0, y_count.sum())).tolist()}
         st.session_state["R"] = {
@@ -773,13 +786,18 @@ with t2:
 with t3:
     if R["metrico"]:
         M = R["metr"]
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Spearman (obs vs λ)", f"{M['spear']:.3f}")
         c2.metric("Captura@10%", f"{100*M['cap10']:.1f}%",
                   help="Fracción de TODOS los siniestros en el 10% de cruces con mayor tasa predicha")
-        c3.metric("ROC-AUC (≥1)", f"{M['roc']:.3f}" if not np.isnan(M["roc"]) else "—")
+        c3.metric("D² (devianza Poisson)", f"{M['d2']:.3f}",
+                  help="Fracción de la devianza de Poisson explicada por el modelo "
+                       "frente al modelo nulo (análogo del R² para conteos)")
+        c4.metric("MAE", f"{M['mae']:.3f}", f"RMSE {M['rmse']:.3f}",
+                  delta_color="off")
 
         cc = st.columns(2)
+        # curva de captura: la lectura operativa del ranking (tesis)
         figcap = px.line(x=M["curva_x"], y=M["curva_y"],
                          labels={"x": "Fracción de intersecciones intervenidas",
                                  "y": "Fracción de siniestros capturados"},
@@ -791,15 +809,21 @@ with t3:
         figcap.update_layout(height=360, margin=dict(t=40, b=0),
                              xaxis_range=[0, 1], yaxis_range=[0, 1.02])
         cc[0].plotly_chart(figcap, use_container_width=True)
-        cm = M["cm"]
-        figcm = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
-                          x=["Pred: no prioritario", "Pred: prioritario"],
-                          y=["Real: sin siniestros", "Real: con siniestros"],
-                          title="Presupuesto top 10% (ranking EB) vs binaria")
-        figcm.update_layout(height=360, margin=dict(t=40, b=0))
-        cc[1].plotly_chart(figcm, use_container_width=True)
-        st.caption("Predicciones out-of-fold con CV espacial por bloques; modelo de conteo "
-                   "tipo SPF con verosimilitud de Poisson (configuración exacta de la tesis).")
+        # calibración por deciles de lambda: el diagnóstico canónico de una SPF
+        cal = pd.DataFrame({"Decil de λ": list(range(1, 11)),
+                            "Observado (media n_acc)": M["cal_obs"],
+                            "Predicho (media λ)": M["cal_pred"]})
+        figcal = px.bar(cal.melt(id_vars="Decil de λ", var_name="Serie", value_name="Media"),
+                        x="Decil de λ", y="Media", color="Serie", barmode="group",
+                        title="Calibración por deciles de la tasa predicha",
+                        color_discrete_sequence=["#2b8cbe", "#d7301f"])
+        figcal.update_layout(height=360, margin=dict(t=40, b=0),
+                             legend=dict(orientation="h", y=1.12))
+        cc[1].plotly_chart(figcal, use_container_width=True)
+        st.caption(f"Regresión de conteo tipo SPF (verosimilitud de Poisson) con predicciones "
+                   f"out-of-fold de la CV espacial. ROC-AUC contra la binaria ≥1 (solo como "
+                   f"referencia comparativa): {M['roc']:.3f}. Si las barras observadas crecen "
+                   f"con el decil y acompañan a las predichas, el modelo ordena y calibra bien.")
 
     st.subheader("Validación temporal + Empírico-Bayes")
     if R.get("res_t") is not None:
