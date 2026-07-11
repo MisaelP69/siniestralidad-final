@@ -1,0 +1,10 @@
+streamlit>=1.35
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
+osmnx>=2.0
+folium>=0.16
+branca>=0.7
+plotly>=5.20
+xgboost>=2.0
